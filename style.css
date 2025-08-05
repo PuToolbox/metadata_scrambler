@@ -1,0 +1,23 @@
+body {
+    font-family: Arial, sans-serif;
+    text-align: center;
+}
+
+#dropZone {
+    border: 2px dashed #ccc;
+    padding: 20px;
+    margin: 20px auto;
+    width: 300px;
+}
+
+#dropZone.dragover {
+    background: #e1e1e1;
+}
+
+#status {
+    color: #333;
+}
+
+.error {
+    color: red;
+}
