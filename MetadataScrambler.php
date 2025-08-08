@@ -21,9 +21,15 @@ class MetadataScrambler
             'scramble_file_timestamps' => false,
             'use_same_timestamp' => true,
             'manipulate_system_time' => false,
-            'system_time_method' => 'auto'
+            'system_time_method' => 'auto',
+            // New hash obfuscation options
+            'obfuscate_hashes' => true,
+            'hash_obfuscation_methods' => ['noise', 'artifacts'], // 'noise', 'artifacts', 'micro_resize', 'gamma'
+            'noise_intensity' => 1,
+            'log_hash_changes' => false
         ], $options);
-        $this->writeLog("MetadataScrambler initialized with options: " . json_encode($this->options));
+        
+        $this->writeLog("MetadataScrambler initialized with hash obfuscation options: " . json_encode($this->options));
 
         // Check for required PHP extensions
         if (!extension_loaded('gd')) {
@@ -64,6 +70,254 @@ class MetadataScrambler
         ];
         $this->writeLog("Generated metadata: " . json_encode($metadata));
         return $metadata;
+    }
+
+    /**
+     * Add subtle visual noise to break perceptual hashes while maintaining visual quality
+     */
+    private function addSubtleNoise($image, $intensity = 1)
+    {
+        $width = imagesx($image);
+        $height = imagesy($image);
+        
+        // Add minimal random noise to break perceptual hashes
+        for ($i = 0; $i < $width * $height * 0.001; $i++) { // Affect 0.1% of pixels
+            $x = mt_rand(0, $width - 1);
+            $y = mt_rand(0, $height - 1);
+            
+            $rgb = imagecolorat($image, $x, $y);
+            $r = ($rgb >> 16) & 0xFF;
+            $g = ($rgb >> 8) & 0xFF;
+            $b = $rgb & 0xFF;
+            
+            // Add subtle noise (±1-2 values)
+            $r = max(0, min(255, $r + mt_rand(-$intensity, $intensity)));
+            $g = max(0, min(255, $g + mt_rand(-$intensity, $intensity)));
+            $b = max(0, min(255, $b + mt_rand(-$intensity, $intensity)));
+            
+            $newColor = imagecolorallocate($image, $r, $g, $b);
+            imagesetpixel($image, $x, $y, $newColor);
+        }
+        
+        $this->writeLog("Applied subtle noise for hash obfuscation");
+        return $image;
+    }
+
+    /**
+     * Apply minimal compression artifacts to change hash without visible quality loss
+     */
+    private function applyMinimalArtifacts($image)
+    {
+        // Create temporary file for recompression
+        $tempFile = tempnam(sys_get_temp_dir(), 'hash_obf');
+        
+        // Save with slight quality variation
+        $quality = mt_rand(92, 98); // High quality range
+        imagejpeg($image, $tempFile, $quality);
+        
+        // Reload to introduce minimal artifacts
+        $newImage = imagecreatefromjpeg($tempFile);
+        unlink($tempFile);
+        
+        $this->writeLog("Applied minimal compression artifacts (quality: $quality)");
+        return $newImage;
+    }
+
+    /**
+     * Resize by 1 pixel and back to original size (imperceptible change)
+     */
+    private function microResize($image)
+    {
+        $width = imagesx($image);
+        $height = imagesy($image);
+        
+        // Resize down by 1 pixel
+        $tempImage = imagecreatetruecolor($width - 1, $height - 1);
+        imagecopyresampled($tempImage, $image, 0, 0, 0, 0, 
+                           $width - 1, $height - 1, $width, $height);
+        
+        // Resize back to original
+        $finalImage = imagecreatetruecolor($width, $height);
+        imagecopyresampled($finalImage, $tempImage, 0, 0, 0, 0,
+                           $width, $height, $width - 1, $height - 1);
+        
+        imagedestroy($tempImage);
+        
+        $this->writeLog("Applied micro-resize hash obfuscation");
+        return $finalImage;
+    }
+
+    /**
+     * Apply gamma correction with minimal visual impact
+     */
+    private function subtleGammaCorrection($image)
+    {
+        // Apply very subtle gamma correction (0.98-1.02 range)
+        $gamma = mt_rand(98, 102) / 100;
+        imagegammacorrect($image, 1.0, $gamma);
+        
+        $this->writeLog("Applied subtle gamma correction: $gamma");
+        return $image;
+    }
+
+    /**
+     * Enhanced JPEG scrambling with hash obfuscation
+     */
+    private function scrambleJpegWithHashObfuscation($inputPath, $outputPath, $metadata)
+    {
+        if (!function_exists('imagecreatefromjpeg')) {
+            $this->writeLog("GD extension not available for JPEG processing");
+            return false;
+        }
+
+        try {
+            $image = imagecreatefromjpeg($inputPath);
+            if ($image === false) {
+                $this->writeLog("Failed to create image resource from $inputPath");
+                return false;
+            }
+
+            // Apply hash obfuscation techniques if enabled
+            if (isset($this->options['obfuscate_hashes']) && $this->options['obfuscate_hashes']) {
+                $methods = $this->options['hash_obfuscation_methods'] ?? ['noise', 'artifacts'];
+                
+                foreach ($methods as $method) {
+                    switch ($method) {
+                        case 'noise':
+                            $image = $this->addSubtleNoise($image, $this->options['noise_intensity'] ?? 1);
+                            break;
+                        case 'artifacts':
+                            $image = $this->applyMinimalArtifacts($image);
+                            break;
+                        case 'micro_resize':
+                            $image = $this->microResize($image);
+                            break;
+                        case 'gamma':
+                            $image = $this->subtleGammaCorrection($image);
+                            break;
+                    }
+                }
+            }
+
+            // Use variable quality to ensure different file hash
+            $baseQuality = $this->options['preserve_quality'] ? $this->options['jpeg_quality'] : 90;
+            $quality = $baseQuality + mt_rand(-2, 2); // Small random variation
+            $quality = max(85, min(100, $quality)); // Keep within reasonable bounds
+            
+            if (!imagejpeg($image, $outputPath, $quality)) {
+                imagedestroy($image);
+                $this->writeLog("Failed to save processed JPEG to $outputPath");
+                return false;
+            }
+            imagedestroy($image);
+
+            // Add metadata as before
+            if (!$this->options['strip_only'] && $metadata) {
+                if (!$this->addComprehensiveExifToJpeg($outputPath, $metadata)) {
+                    $this->writeLog("Failed to add EXIF data to $outputPath");
+                    return false;
+                }
+            }
+
+            if (!$this->removeJpegComment($outputPath)) {
+                $this->writeLog("Failed to remove JPEG comments from $outputPath");
+                return false;
+            }
+
+            $this->writeLog("JPEG processing with hash obfuscation completed for $inputPath");
+            return true;
+        } catch (Exception $e) {
+            $this->writeLog("JPEG processing failed for $inputPath: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Calculate and log hash changes for verification
+     */
+    private function logHashChanges($originalPath, $processedPath)
+    {
+        if (!file_exists($originalPath) || !file_exists($processedPath)) {
+            return;
+        }
+        
+        $originalMd5 = md5_file($originalPath);
+        $processedMd5 = md5_file($processedPath);
+        
+        $originalSha256 = hash_file('sha256', $originalPath);
+        $processedSha256 = hash_file('sha256', $processedPath);
+        
+        $this->writeLog("Hash verification:");
+        $this->writeLog("  Original MD5:   $originalMd5");
+        $this->writeLog("  Processed MD5:  $processedMd5");
+        $this->writeLog("  MD5 Changed:    " . ($originalMd5 !== $processedMd5 ? 'YES' : 'NO'));
+        $this->writeLog("  Original SHA256: $originalSha256");
+        $this->writeLog("  Processed SHA256: $processedSha256");
+        $this->writeLog("  SHA256 Changed: " . ($originalSha256 !== $processedSha256 ? 'YES' : 'NO'));
+    }
+
+    /**
+     * Enhanced scramble method with hash verification
+     */
+    public function scrambleWithHashVerification($inputPath, $outputPath, $fileType = null)
+    {
+        if (!file_exists($inputPath)) {
+            $this->writeLog("Input file not found: $inputPath");
+            return false;
+        }
+
+        if ($fileType === null) {
+            $fileType = $this->detectFileType($inputPath);
+        }
+
+        $this->writeLog("Scrambling with hash obfuscation for $inputPath, Type: $fileType");
+        $metadata = $this->options['strip_only'] ? null : $this->generateRandomMetadata();
+
+        $result = false;
+
+        if ($this->options['manipulate_system_time'] && $metadata) {
+            $result = $this->executeWithFakeSystemTime($metadata, function () use ($inputPath, $outputPath, $fileType, $metadata) {
+                return $this->processFileWithHashObfuscation($inputPath, $outputPath, $fileType, $metadata);
+            });
+        } else {
+            $result = $this->processFileWithHashObfuscation($inputPath, $outputPath, $fileType, $metadata);
+        }
+
+        if ($result && $this->options['scramble_file_timestamps'] && !$this->options['manipulate_system_time'] && $metadata) {
+            $this->scrambleFileSystemTimestamps($outputPath, $metadata);
+        }
+
+        if ($result && $this->options['validate_output']) {
+            $result = $this->validateOutput($outputPath, $fileType);
+            $this->writeLog($result ? "Output validation passed for $outputPath" : "Output validation failed for $outputPath");
+        }
+
+        // Log hash changes if enabled
+        if ($result && $this->options['log_hash_changes']) {
+            $this->logHashChanges($inputPath, $outputPath);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Process file with hash obfuscation
+     */
+    private function processFileWithHashObfuscation($inputPath, $outputPath, $fileType, $metadata)
+    {
+        switch ($fileType) {
+            case 'image/jpeg':
+                $result = $this->scrambleJpegWithHashObfuscation($inputPath, $outputPath, $metadata);
+                break;
+            case 'image/png':
+                $result = $this->scramblePng($inputPath, $outputPath, $metadata);
+                break;
+            default:
+                $result = $this->processFile($inputPath, $outputPath, $fileType, $metadata);
+                break;
+        }
+
+        return $result;
     }
 
     private function validateExifStructure($exifData)
@@ -175,12 +429,13 @@ class MetadataScrambler
     private function calculateGpsDataSize($metadata)
     {
         // GPS data size calculation:
+        // GPSVersionID: 4 bytes
         // GPSLatitudeRef: 2 bytes
         // GPSLatitude: 24 bytes (3 rationals)
         // GPSLongitudeRef: 2 bytes  
         // GPSLongitude: 24 bytes (3 rationals)
         // GPSAltitude: 8 bytes (1 rational)
-        return 2 + 24 + 2 + 24 + 8; // Total: 60 bytes
+        return 4 + 2 + 24 + 2 + 24 + 8; // Total: 64 bytes
     }
 
     private function buildGpsIfd($metadata)
@@ -298,51 +553,6 @@ class MetadataScrambler
 
         $this->writeLog("Comprehensive EXIF data added to $filePath");
         return true;
-    }
-
-    // ... rest of the methods remain the same as in your original code ...
-    // I'm focusing on the GPS directory fix, but the other methods can stay unchanged
-
-    private function scrambleJpeg($inputPath, $outputPath, $metadata)
-    {
-        if (!function_exists('imagecreatefromjpeg')) {
-            $this->writeLog("GD extension not available for JPEG processing");
-            return false;
-        }
-
-        try {
-            $image = imagecreatefromjpeg($inputPath);
-            if ($image === false) {
-                $this->writeLog("Failed to create image resource from $inputPath");
-                return false;
-            }
-
-            $quality = $this->options['preserve_quality'] ? $this->options['jpeg_quality'] : 90;
-            if (!imagejpeg($image, $outputPath, $quality)) {
-                imagedestroy($image);
-                $this->writeLog("Failed to save processed JPEG to $outputPath");
-                return false;
-            }
-            imagedestroy($image);
-
-            if (!$this->options['strip_only'] && $metadata) {
-                if (!$this->addComprehensiveExifToJpeg($outputPath, $metadata)) {
-                    $this->writeLog("Failed to add EXIF data to $outputPath");
-                    return false;
-                }
-            }
-
-            if (!$this->removeJpegComment($outputPath)) {
-                $this->writeLog("Failed to remove JPEG comments from $outputPath");
-                return false;
-            }
-
-            $this->writeLog("JPEG processing completed for $inputPath");
-            return true;
-        } catch (Exception $e) {
-            $this->writeLog("JPEG processing failed for $inputPath: " . $e->getMessage());
-            return false;
-        }
     }
 
     private function removeJpegComment($filePath)
@@ -1270,7 +1480,7 @@ class MetadataScrambler
     {
         switch ($fileType) {
             case 'image/jpeg':
-                $result = $this->scrambleJpeg($inputPath, $outputPath, $metadata);
+                $result = $this->scrambleJpegWithHashObfuscation($inputPath, $outputPath, $metadata);
                 break;
             case 'image/png':
                 $result = $this->scramblePng($inputPath, $outputPath, $metadata);
@@ -1375,320 +1585,216 @@ class MetadataScrambler
                 }
                 break;
             case 'audio/mpeg':
-                $content = file_get_contents($filePath, false, null, 0, 3);
-                if (substr($content, 0, 2) !== "\xFF\xFB" && substr($content, 0, 3) !== 'ID3') {
-                    $this->writeLog("MP3 validation failed: invalid header - $filePath");
+                // Check for MP3 frame sync (11 bits set to 1)
+                if (substr($content, 0, 2) !== "\xFF\xFB" && substr($content, 0, 2) !== "\xFF\xFA") {
+                    $this->writeLog("MP3 validation failed: invalid frame sync - $filePath");
                     return false;
                 }
                 break;
             case 'application/msword':
             case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                return true;
+                if ($fileType === 'application/msword' && substr($content, 0, 8) !== "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") {
+                    $this->writeLog("DOC validation failed: invalid header - $filePath");
+                    return false;
+                } elseif ($fileType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+                    $zip = new ZipArchive();
+                    if ($zip->open($filePath) !== true || $zip->locateName('word/document.xml') === false) {
+                        $this->writeLog("DOCX validation failed: invalid structure - $filePath");
+                        $zip->close();
+                        return false;
+                    }
+                    $zip->close();
+                }
+                break;
+            default:
+                $this->writeLog("Output validation skipped: unknown file type - $fileType");
+                return true; // Allow unknown types to pass if they exist
         }
 
+        $this->writeLog("Output validation passed for $filePath");
         return true;
     }
 
     private function scrambleFileSystemTimestamps($filePath, $metadata)
     {
-        try {
-            $fakeTimestamp = strtotime(str_replace(':', '-', substr($metadata['date'], 0, 10)) . ' ' . substr($metadata['date'], 11));
-            if ($fakeTimestamp === false) {
-                $this->writeLog("Invalid date format for file system timestamp: {$metadata['date']}");
-                return false;
-            }
+        $timestamp = strtotime(str_replace(':', '-', substr($metadata['date'], 0, 10)) . ' ' . substr($metadata['date'], 11));
+        if ($timestamp === false) {
+            $this->writeLog("Invalid timestamp for $filePath: {$metadata['date']}");
+            return false;
+        }
 
-            if ($this->options['use_same_timestamp']) {
-                if (touch($filePath, $fakeTimestamp, $fakeTimestamp)) {
-                    $this->writeLog("File system timestamps updated for $filePath: " . date('Y-m-d H:i:s', $fakeTimestamp));
-                    return true;
-                } else {
-                    $this->writeLog("Failed to update file system timestamps for $filePath");
-                    return false;
-                }
-            } else {
-                $accessTimestamp = $fakeTimestamp + mt_rand(-86400, 86400);
-                if (touch($filePath, $fakeTimestamp, $accessTimestamp)) {
-                    $this->writeLog("File system timestamps updated for $filePath - Mod: " .
-                        date('Y-m-d H:i:s', $fakeTimestamp) . ", Access: " . date('Y-m-d H:i:s', $accessTimestamp));
-                    return true;
-                } else {
-                    $this->writeLog("Failed to update file system timestamps for $filePath");
-                    return false;
-                }
-            }
-        } catch (Exception $e) {
-            $this->writeLog("File system timestamp scrambling failed for $filePath: " . $e->getMessage());
+        // Add random jitter if not using same timestamp
+        if (!$this->options['use_same_timestamp']) {
+            $jitter = mt_rand(-86400, 86400); // ±1 day
+            $timestamp += $jitter;
+            $this->writeLog("Applied timestamp jitter: $jitter seconds");
+        }
+
+        if (touch($filePath, $timestamp)) {
+            $this->writeLog("Set filesystem timestamp for $filePath to " . date('Y-m-d H:i:s', $timestamp));
+            return true;
+        } else {
+            $this->writeLog("Failed to set filesystem timestamp for $filePath");
             return false;
         }
     }
 
-    public function getFileSystemTimestamps($filePath)
-    {
-        if (!file_exists($filePath)) {
-            return false;
-        }
-
-        return [
-            'modification_time' => date('Y-m-d H:i:s', filemtime($filePath)),
-            'access_time' => date('Y-m-d H:i:s', fileatime($filePath)),
-            'change_time' => date('Y-m-d H:i:s', filectime($filePath)),
-            'modification_timestamp' => filemtime($filePath),
-            'access_timestamp' => fileatime($filePath),
-            'change_timestamp' => filectime($filePath)
-        ];
-    }
-
-    public function scrambleDirectory($inputDir, $outputDir, $recursive = false)
+    /**
+     * Process directory recursively with hash obfuscation
+     */
+    public function scrambleDirectory($inputDir, $outputDir, $fileType = null)
     {
         if (!is_dir($inputDir)) {
-            $this->writeLog("Input directory does not exist: $inputDir");
+            $this->writeLog("Input directory not found: $inputDir");
             return false;
         }
 
-        if (!is_dir($outputDir)) {
-            if (!mkdir($outputDir, 0755, true)) {
-                $this->writeLog("Failed to create output directory: $outputDir");
-                return false;
-            }
+        if (!is_dir($outputDir) && !mkdir($outputDir, 0755, true)) {
+            $this->writeLog("Failed to create output directory: $outputDir");
+            return false;
         }
 
-        $iterator = $recursive ?
-            new RecursiveIteratorIterator(new RecursiveDirectoryIterator($inputDir)) :
-            new DirectoryIterator($inputDir);
+        $success = true;
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($inputDir, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
 
-        $processed = 0;
-        $failed = 0;
+        foreach ($iterator as $item) {
+            $relativePath = substr($item->getPathname(), strlen($inputDir));
+            $outputPath = $outputDir . $relativePath;
 
-        foreach ($iterator as $file) {
-            if ($file->isDot() || $file->isDir()) {
+            if ($item->isDir()) {
+                if (!is_dir($outputPath) && !mkdir($outputPath, 0755, true)) {
+                    $this->writeLog("Failed to create directory: $outputPath");
+                    $success = false;
+                }
                 continue;
             }
 
-            $inputPath = $file->getPathname();
-            $relativePath = $recursive ?
-                str_replace($inputDir . DIRECTORY_SEPARATOR, '', $inputPath) :
-                $file->getFilename();
-            $outputPath = $outputDir . DIRECTORY_SEPARATOR . $relativePath;
-
-            $outputSubdir = dirname($outputPath);
-            if (!is_dir($outputSubdir)) {
-                mkdir($outputSubdir, 0755, true);
-            }
-
-            $fileType = $this->detectFileType($inputPath);
-            if ($this->scramble($inputPath, $outputPath, $fileType)) {
-                $processed++;
-                $this->writeLog("Successfully processed: $relativePath");
-            } else {
-                $failed++;
-                $this->writeLog("Failed to process: $relativePath");
+            $detectedFileType = $fileType ?: $this->detectFileType($item->getPathname());
+            $result = $this->scrambleWithHashVerification($item->getPathname(), $outputPath, $detectedFileType);
+            if (!$result) {
+                $this->writeLog("Failed to scramble file: {$item->getPathname()}");
+                $success = false;
             }
         }
 
-        $this->writeLog("Batch processing completed. Processed: $processed, Failed: $failed");
-        return ['processed' => $processed, 'failed' => $failed];
+        $this->writeLog("Directory scrambling completed for $inputDir");
+        return $success;
     }
 
-    public function analyzeFile($filePath)
+    /**
+     * Get supported file types
+     */
+    public function getSupportedFileTypes()
     {
-        if (!file_exists($filePath)) {
+        $types = [
+            'image/jpeg' => ['jpg', 'jpeg'],
+            'image/png' => ['png'],
+            'image/gif' => ['gif'],
+            'image/webp' => ['webp'],
+            'image/tiff' => ['tif', 'tiff'],
+            'application/pdf' => ['pdf'],
+            'audio/mpeg' => ['mp3'],
+            'application/msword' => ['doc'],
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document' => ['docx']
+        ];
+
+        $this->writeLog("Retrieved supported file types");
+        return $types;
+    }
+
+    /**
+     * Batch process multiple files with hash obfuscation
+     */
+    public function batchScramble(array $inputFiles, $outputDir, $fileType = null)
+    {
+        if (!is_dir($outputDir) && !mkdir($outputDir, 0755, true)) {
+            $this->writeLog("Failed to create output directory: $outputDir");
             return false;
         }
 
-        $info = [
-            'path' => $filePath,
-            'size' => filesize($filePath),
-            'mime_type' => $this->detectFileType($filePath),
-            'supported' => false,
-            'metadata_found' => []
+        $success = true;
+        foreach ($inputFiles as $inputPath) {
+            if (!file_exists($inputPath)) {
+                $this->writeLog("Input file not found: $inputPath");
+                $success = false;
+                continue;
+            }
+
+            $filename = basename($inputPath);
+            $outputPath = rtrim($outputDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $filename;
+            $detectedFileType = $fileType ?: $this->detectFileType($inputPath);
+
+            $result = $this->scrambleWithHashVerification($inputPath, $outputPath, $detectedFileType);
+            if (!$result) {
+                $this->writeLog("Failed to scramble file: $inputPath");
+                $success = false;
+            }
+        }
+
+        $this->writeLog("Batch processing completed for " . count($inputFiles) . " files");
+        return $success;
+    }
+
+    /**
+     * Get processing statistics from log file
+     */
+    public function getProcessingStats()
+    {
+        if (!file_exists($this->logFile)) {
+            return [
+                'total_files' => 0,
+                'successful' => 0,
+                'failed' => 0,
+                'last_processed' => null
+            ];
+        }
+
+        $logContent = file($this->logFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        $stats = [
+            'total_files' => 0,
+            'successful' => 0,
+            'failed' => 0,
+            'last_processed' => null
         ];
 
-        $supportedTypes = [
-            'image/jpeg',
-            'image/png',
-            'image/gif',
-            'image/webp',
-            'image/tiff',
-            'application/pdf',
-            'audio/mpeg',
-            'application/msword',
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        ];
-
-        $info['supported'] = in_array($info['mime_type'], $supportedTypes);
-
-        switch ($info['mime_type']) {
-            case 'image/jpeg':
-                $info['metadata_found'] = $this->detectJpegMetadata($filePath);
-                break;
-            case 'image/png':
-                $info['metadata_found'] = $this->detectPngMetadata($filePath);
-                break;
-            case 'image/gif':
-                $info['metadata_found'] = $this->detectGifMetadata($filePath);
-                break;
-            case 'image/webp':
-                $info['metadata_found'] = $this->detectWebpMetadata($filePath);
-                break;
-            case 'image/tiff':
-                $info['metadata_found'] = $this->detectTiffMetadata($filePath);
-                break;
-            case 'application/pdf':
-                $info['metadata_found'] = $this->detectPdfMetadata($filePath);
-                break;
-            case 'audio/mpeg':
-                $info['metadata_found'] = $this->detectMp3Metadata($filePath);
-                break;
-            case 'application/msword':
-            case 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-                $info['metadata_found'] = $this->detectWordMetadata($filePath, $info['mime_type']);
-                break;
-        }
-
-        $info['file_system'] = $this->getFileSystemTimestamps($filePath);
-        return $info;
-    }
-
-    private function detectJpegMetadata($filePath)
-    {
-        $found = [];
-        $content = file_get_contents($filePath, false, null, 0, 4096);
-        if (strpos($content, 'Exif') !== false) {
-            $found[] = 'EXIF data';
-        }
-        if (strpos($content, 'http://ns.adobe.com/xap/1.0/') !== false) {
-            $found[] = 'XMP data';
-        }
-        if (strpos($content, 'Photoshop') !== false) {
-            $found[] = 'Photoshop data';
-        }
-        if (strpos($content, "\xFF\xFE") !== false) {
-            $found[] = 'COM segment';
-        }
-        return $found;
-    }
-
-    private function detectPngMetadata($filePath)
-    {
-        $found = [];
-        $content = file_get_contents($filePath, false, null, 0, 4096);
-        if (strpos($content, 'tEXt') !== false) {
-            $found[] = 'Text chunks';
-        }
-        if (strpos($content, 'zTXt') !== false) {
-            $found[] = 'Compressed text chunks';
-        }
-        if (strpos($content, 'iTXt') !== false) {
-            $found[] = 'International text chunks';
-        }
-        if (strpos($content, 'tIME') !== false) {
-            $found[] = 'Timestamp';
-        }
-        return $found;
-    }
-
-    private function detectGifMetadata($filePath)
-    {
-        $found = [];
-        $content = file_get_contents($filePath, false, null, 0, 4096);
-        if (strpos($content, "\x21\xFF\x0B") !== false) {
-            $found[] = 'Application extension (possible XMP)';
-        }
-        if (strpos($content, "\x21\xFE") !== false) {
-            $found[] = 'Comment extension';
-        }
-        return $found;
-    }
-
-    private function detectWebpMetadata($filePath)
-    {
-        $found = [];
-        $content = file_get_contents($filePath, false, null, 0, 4096);
-        if (strpos($content, 'EXIF') !== false) {
-            $found[] = 'EXIF data';
-        }
-        if (strpos($content, 'XMP ') !== false) {
-            $found[] = 'XMP data';
-        }
-        return $found;
-    }
-
-    private function detectTiffMetadata($filePath)
-    {
-        $found = [];
-        $content = file_get_contents($filePath, false, null, 0, 4096);
-        if (strpos($content, 'Exif') !== false) {
-            $found[] = 'EXIF data';
-        }
-        return $found;
-    }
-
-    private function detectPdfMetadata($filePath)
-    {
-        $found = [];
-        $content = file_get_contents($filePath, false, null, 0, 4096);
-        if (strpos($content, '/Info') !== false) {
-            $found[] = 'Info dictionary';
-        }
-        if (strpos($content, '/Title') !== false) {
-            $found[] = 'Title';
-        }
-        if (strpos($content, '/Author') !== false) {
-            $found[] = 'Author';
-        }
-        if (strpos($content, '/Creator') !== false) {
-            $found[] = 'Creator';
-        }
-        if (strpos($content, '/Producer') !== false) {
-            $found[] = 'Producer';
-        }
-        if (strpos($content, 'x:xmpmeta') !== false) {
-            $found[] = 'XMP metadata';
-        }
-        return $found;
-    }
-
-    private function detectMp3Metadata($filePath)
-    {
-        $found = [];
-        $content = file_get_contents($filePath, false, null, 0, 4096);
-        if (substr($content, 0, 3) === 'ID3') {
-            $found[] = 'ID3v2 tag';
-        }
-        $fileSize = filesize($filePath);
-        if ($fileSize >= 128 && substr(file_get_contents($filePath, false, null, -128, 3), 0, 3) === 'TAG') {
-            $found[] = 'ID3v1 tag';
-        }
-        return $found;
-    }
-
-    private function detectWordMetadata($filePath, $fileType)
-    {
-        $found = [];
-        if ($fileType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-            $zip = new ZipArchive();
-            if ($zip->open($filePath) === true) {
-                if ($zip->getFromName('docProps/core.xml') !== false) {
-                    $found[] = 'Core properties';
-                }
-                if ($zip->getFromName('docProps/app.xml') !== false) {
-                    $found[] = 'App properties';
-                }
-                if ($zip->getFromName('docProps/custom.xml') !== false) {
-                    $found[] = 'Custom properties';
-                }
-                $zip->close();
+        foreach ($logContent as $line) {
+            if (preg_match('/Scrambling (?:with hash obfuscation for|metadata for) (.+?), Type:/', $line)) {
+                $stats['total_files']++;
             }
-        } else {
-            $content = file_get_contents($filePath, false, null, 0, 4096);
-            if (strpos($content, "\x05SummaryInformation") !== false) {
-                $found[] = 'Summary Information';
+            if (strpos($line, 'processing completed for') !== false) {
+                $stats['successful']++;
             }
-            if (strpos($content, "\x05DocumentSummaryInformation") !== false) {
-                $found[] = 'Document Summary Information';
+            if (strpos($line, 'Failed to') !== false) {
+                $stats['failed']++;
+            }
+            if (preg_match('/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]/', $line, $matches)) {
+                $stats['last_processed'] = max($stats['last_processed'], $matches[1]);
             }
         }
-        return $found;
+
+        $this->writeLog("Retrieved processing statistics");
+        return $stats;
+    }
+
+    /**
+     * Clean up temporary files
+     */
+    public function cleanup()
+    {
+        $tempDir = sys_get_temp_dir();
+        $files = glob($tempDir . '/hash_obf*');
+        $count = 0;
+
+        foreach ($files as $file) {
+            if (unlink($file)) {
+                $count++;
+            }
+        }
+
+        $this->writeLog("Cleaned up $count temporary hash obfuscation files");
+        return $count;
     }
 }
